@@ -145,8 +145,8 @@ def trade_loop():
 
         # ── Signal ────────────────────────────────────────────────────────
         sig = "HOLD"
-        if mom >  0.0001 and r < 75: sig = "UP"
-        if mom < -0.0001 and r > 25: sig = "DOWN"
+        if mom >  0.0001 and r < 85: sig = "UP"
+        if mom < -0.0001 and r > 15: sig = "DOWN"
         state["signal"] = sig
 
         # ── Open trade (max 1 open at a time) ────────────────────────────
@@ -208,6 +208,7 @@ def trade_loop():
             save_trade(t)
 
         time.sleep(60)
+
 
 
 HTML = """<!DOCTYPE html>
@@ -361,8 +362,16 @@ footer{font-size:11px;color:#aaa;margin-top:14px;display:flex;justify-content:sp
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
 let s=15;
-setInterval(()=>{s--;if(s<=0)s=15;document.getElementById('cd').textContent='next update in '+s+'s';},1000);
-const btc={{d.btc_candles|tojson}};
+setInterval(()=>{
+  s--;
+  if(s<=0)s=15;
+  const pending = "{{d.pending[0].settles if d.pending else ''}}";
+  if(pending) {
+    document.getElementById('cd').textContent='trade settles at ' + pending + ' · refresh in ' + s + 's';
+  } else {
+    document.getElementById('cd').textContent='next update in ' + s + 's';
+  }
+},1000);
 const eq={{d.equity|tojson}};
 const up={{d.btc_change}}>=0;
 const gc=up?'#1a7a4a':'#b83232';
@@ -415,4 +424,6 @@ def index():
 if __name__ == "__main__":
     threading.Thread(target=trade_loop, daemon=True).start()
     print("\n  http://localhost:5000\n")
-    app.run(debug=False, port=5000)
+  import os
+port = int(os.environ.get("PORT", 5000))
+app.run(debug=False, host="0.0.0.0", port=port)
