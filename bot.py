@@ -69,12 +69,35 @@ state = {
 }
 
 def get_candles():
+    """Try Binance first, fall back to Coinbase if blocked (e.g. on Render)."""
+    # 1. Binance — best on local/EU networks
     try:
         r = requests.get("https://api.binance.com/api/v3/klines",
             params={"symbol":"BTCUSDT","interval":"1m","limit":120}, timeout=5)
-        return r.json()
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and len(data) >= 30:
+                return data
     except Exception:
-        return []
+        pass
+    # 2. Coinbase Exchange — works from cloud servers Binance blocks
+    try:
+        r = requests.get(
+            "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+            params={"granularity": 60}, timeout=5,
+            headers={"User-Agent": "btc-bot/1.0"},
+        )
+        if r.status_code == 200:
+            raw = r.json()  # [[time, low, high, open, close, volume], ...] newest first
+            out = []
+            for row in reversed(raw):
+                t, lo, hi, op, cl, vol = row
+                out.append([int(t)*1000, op, hi, lo, cl, vol,
+                            int(t)*1000+59999, 0, 0, 0, 0, 0])
+            return out
+    except Exception:
+        pass
+    return []
 
 def calc_rsi(closes, p=7):
     if len(closes) < p+1: return 50.0
