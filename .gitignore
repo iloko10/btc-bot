@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# Local data (not deployed)
+trades.db
+*.sqlite
+*.sqlite3
+logs/*.log
+
+# Local tools (downloaded, not source code)
+cloudflared.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Misc
+*.bak
+*.swp
