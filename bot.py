@@ -71,9 +71,9 @@ state = {
 def get_candles():
     try:
         r = requests.get("https://api.binance.com/api/v3/klines",
-            params={"symbol":"BTCUSDT","interval":"1m","limit":40}, timeout=5)
+            params={"symbol":"BTCUSDT","interval":"1m","limit":120}, timeout=5)
         return r.json()
-    except:
+    except Exception:
         return []
 
 def calc_rsi(closes, p=7):
@@ -82,6 +82,26 @@ def calc_rsi(closes, p=7):
     g = np.mean(np.where(d>0,d,0)[-p:])
     l = np.mean(np.where(d<0,-d,0)[-p:])
     return 100 if l==0 else 100-(100/(1+g/l))
+
+def calc_ema(prices, period):
+    """Standard EMA; falls back to SMA when not enough data."""
+    if len(prices) < period:
+        return float(np.mean(prices))
+    k = 2 / (period + 1)
+    ema = float(np.mean(prices[:period]))
+    for x in prices[period:]:
+        ema = x * k + ema * (1 - k)
+    return ema
+
+def calc_atr(highs, lows, closes, p=14):
+    """Average True Range over the last p bars."""
+    if len(closes) < p + 1:
+        return 0.0
+    tr = []
+    for i in range(1, len(closes)):
+        h, l, pc = highs[i], lows[i], closes[i-1]
+        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return float(np.mean(tr[-p:]))
 
 def trade_loop():
     bankroll, wins, losses, equity, saved_trades = load_state()
@@ -92,17 +112,39 @@ def trade_loop():
     state["trades"] = saved_trades
    
 
+    last_loss_at = 0.0           # cooldown after a losing settle
+    LOSS_COOLDOWN_SEC = 180      # 3 minutes (~3 cycles)
+
     while True:
         candles = get_candles()
         if not candles:
             time.sleep(10)
             continue
 
-        closes  = np.array([float(c[4]) for c in candles])
-        price   = closes[-1]
-        mom     = (closes[-1] - closes[-8]) / closes[-8]
-        r       = calc_rsi(closes)
-        chg     = (closes[-1] - closes[-6]) / closes[-6] * 100
+        valid  = [c for c in candles if len(c) > 4]
+        closes = np.array([float(c[4]) for c in valid])
+        highs  = np.array([float(c[2]) for c in valid])
+        lows   = np.array([float(c[3]) for c in valid])
+        if len(closes) < 30:
+            time.sleep(10)
+            continue
+
+        price = closes[-1]
+        mom   = (closes[-1] - closes[-8]) / closes[-8]
+        r     = calc_rsi(closes)
+        chg   = (closes[-1] - closes[-6]) / closes[-6] * 100
+        ema9  = calc_ema(closes, 9)
+        ema21 = calc_ema(closes, 21)
+        atr   = calc_atr(highs, lows, closes, 14)
+
+        # ATR percentile over last 60 bars (volatility regime)
+        atr_window = []
+        for i in range(max(15, len(closes) - 60), len(closes)):
+            atr_window.append(calc_atr(highs[:i+1], lows[:i+1], closes[:i+1], 14))
+        atr_pct = (
+            float(sum(1 for x in atr_window if x <= atr) / len(atr_window))
+            if atr_window else 0.5
+        )
 
         state["btc_price"]   = round(price, 2)
         state["btc_change"]  = round(chg, 4)
@@ -129,6 +171,7 @@ def trade_loop():
                     pnl_val = -p["size"]
                     pnl_str = f"-${p['size']}"
                     state["losses"] += 1
+                    last_loss_at = now
 
                 for t in state["trades"]:
                     if t["id"] == p["id"]:
@@ -143,16 +186,39 @@ def trade_loop():
                 )
                 state["pending"].remove(p)
 
-        # ── Signal ────────────────────────────────────────────────────────
+        # ── Signal (momentum + tighter RSI + EMA-trend confirm) ──────────
         sig = "HOLD"
-        if mom >  0.0001 and r < 85: sig = "UP"
-        if mom < -0.0001 and r > 15: sig = "DOWN"
+        skip_reason = None
+        if mom > 0.0001 and r < 70 and ema9 > ema21:
+            sig = "UP"
+        elif mom < -0.0001 and r > 30 and ema9 < ema21:
+            sig = "DOWN"
+
+        # Volatility filter: skip chop (bottom 30%) and whipsaw (top 5%)
+        if sig != "HOLD":
+            if atr_pct < 0.30:
+                skip_reason = f"low-vol (ATR pct {atr_pct:.2f})"
+                sig = "HOLD"
+            elif atr_pct > 0.95:
+                skip_reason = f"whipsaw (ATR pct {atr_pct:.2f})"
+                sig = "HOLD"
+
+        # Cooldown after a recent loss
+        if sig != "HOLD" and (now - last_loss_at) < LOSS_COOLDOWN_SEC:
+            secs = int(LOSS_COOLDOWN_SEC - (now - last_loss_at))
+            skip_reason = f"loss cooldown ({secs}s left)"
+            sig = "HOLD"
+
         state["signal"] = sig
+        if skip_reason:
+            state["log"].appendleft(
+                f"{time.strftime('%H:%M:%S')}  skip — {skip_reason}"
+            )
 
         # ── Open trade (max 1 open at a time) ────────────────────────────
         if sig != "HOLD" and len(state["pending"]) == 0:
             kelly     = bankroll * min(abs(mom) * 5, 0.05)
-            size      = round(max(min(kelly, 30.0), 1.0), 2)
+            size      = round(max(min(kelly, 30.0), 5.0), 2)
             mkt_price = float(np.clip(0.5 + mom*3, 0.10, 0.90))
             fill      = round(mkt_price * 1.002, 4)
             trade_id  = int(now)
@@ -220,43 +286,44 @@ HTML = """<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Inter',sans-serif;background:#f5f5f3;color:#1c1c1a;font-size:14px;padding:24px 28px;min-height:100vh}
-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid #e0e0dc}
-.logo{font-size:13px;font-weight:600}.logo span{color:#888;font-weight:400;margin-left:6px}
+body{font-family:'Inter',sans-serif;background:#0d0d0d;color:#e8e8e6;font-size:14px;padding:24px 28px;min-height:100vh}
+header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid #2a2a2a}
+.logo{font-size:13px;font-weight:600}.logo span{color:#777;font-weight:400;margin-left:6px}
 .btc{text-align:right}
 .btc-price{font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:500}
 .btc-chg{font-family:'JetBrains Mono',monospace;font-size:12px;margin-top:2px}
-.up{color:#1a7a4a}.down{color:#b83232}.neutral{color:#888}
+.up{color:#4ade80}.down{color:#f87171}.neutral{color:#888}
 .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:18px}
-.stat{background:#fff;border:1px solid #e0e0dc;border-radius:8px;padding:14px 16px}
+.stat{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:14px 16px}
 .stat-label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px}
 .stat-value{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:500}
 .badge{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:500;padding:2px 10px;border-radius:4px;margin-top:3px}
-.badge.UP{background:#edf7f2;color:#1a7a4a;border:1px solid #b8dfc9}
-.badge.DOWN{background:#fdf1f1;color:#b83232;border:1px solid #f0b8b8}
-.badge.HOLD{background:#f5f5f3;color:#888;border:1px solid #e0e0dc}
-.open-trade{background:#fff8ed;border:1px solid #f0d090;border-radius:8px;padding:12px 16px;margin-bottom:14px;font-size:13px;display:flex;align-items:center;gap:12px}
-.open-label{font-size:11px;color:#a06000;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:2px}
+.badge.UP{background:#10331f;color:#4ade80;border:1px solid #1f6638}
+.badge.DOWN{background:#3a1414;color:#f87171;border:1px solid #6b2222}
+.badge.HOLD{background:#1f1f1f;color:#888;border:1px solid #2a2a2a}
+.open-trade{background:#2a2010;border:1px solid #6b5a20;border-radius:8px;padding:12px 16px;margin-bottom:14px;font-size:13px;display:flex;align-items:center;gap:12px}
+.open-label{font-size:11px;color:#d9a64a;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:2px}
 .grid{display:grid;grid-template-columns:1fr 280px;gap:14px}
-.panel{background:#fff;border:1px solid #e0e0dc;border-radius:8px;padding:16px 18px;margin-bottom:14px}
+.panel{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:16px 18px;margin-bottom:14px}
 .panel:last-child{margin-bottom:0}
 .panel-title{font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:#888;margin-bottom:12px}
 .ind{margin-bottom:14px}.ind:last-child{margin-bottom:0}
 .ind-row{display:flex;justify-content:space-between;font-size:12px;color:#888;margin-bottom:4px}
-.ind-row span:last-child{font-family:'JetBrains Mono',monospace;color:#1c1c1a;font-weight:500}
-.track{height:3px;background:#f0f0ec;border-radius:2px}
+.ind-row span:last-child{font-family:'JetBrains Mono',monospace;color:#e8e8e6;font-weight:500}
+.track{height:3px;background:#2a2a2a;border-radius:2px}
 .fill{height:100%;border-radius:2px}
-.ind-sub{display:flex;justify-content:space-between;font-size:10px;color:#bbb;margin-top:3px}
+.ind-sub{display:flex;justify-content:space-between;font-size:10px;color:#666;margin-top:3px}
 table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:#aaa;padding:0 6px 8px 6px;border-bottom:1px solid #f0f0ec;font-weight:400}
-td{padding:7px 6px;border-bottom:1px solid #f8f8f6;font-family:'JetBrains Mono',monospace;font-size:11px}
+th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:#666;padding:0 6px 8px 6px;border-bottom:1px solid #2a2a2a;font-weight:400}
+td{padding:7px 6px;border-bottom:1px solid #222;font-family:'JetBrains Mono',monospace;font-size:11px;color:#ccc}
 tr:last-child td{border:none}
-.empty{text-align:center;color:#aaa;padding:20px;font-size:12px}
-.log-line{font-family:'JetBrains Mono',monospace;font-size:11px;color:#aaa;padding:4px 0;border-bottom:1px solid #f8f8f6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.log-line:first-child{color:#1c1c1a}.log-line:last-child{border:none}
-footer{font-size:11px;color:#aaa;margin-top:14px;display:flex;justify-content:space-between}
-.warn{color:#a06000}
-#cd{font-family:'JetBrains Mono',monospace;font-size:11px;color:#aaa;margin-top:3px}
+.empty{text-align:center;color:#666;padding:20px;font-size:12px}
+.log-line{font-family:'JetBrains Mono',monospace;font-size:11px;color:#777;padding:4px 0;border-bottom:1px solid #222;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.log-line:first-child{color:#e8e8e6}.log-line:last-child{border:none}
+footer{font-size:11px;color:#666;margin-top:14px;display:flex;justify-content:space-between}
+.warn{color:#d9a64a}
+#cd{font-family:'JetBrains Mono',monospace;font-size:11px;color:#777;margin-top:3px}
+.tv-frame{width:100%;height:380px;border:none;border-radius:6px;background:#0d0d0d}
 </style>
 </head>
 <body>
@@ -294,10 +361,11 @@ footer{font-size:11px;color:#aaa;margin-top:14px;display:flex;justify-content:sp
 <div class="grid">
   <div>
     <div class="panel">
-      <div class="panel-title">BTC price — last 30 min</div>
-      <div style="position:relative;height:150px">
-        <canvas id="btcChart" role="img" aria-label="BTC price chart">BTC price over 30 minutes.</canvas>
-      </div>
+      <div class="panel-title">BTC live — TradingView</div>
+      <iframe class="tv-frame"
+        src="https://s.tradingview.com/widgetembed/?frameElementId=tv-btc&symbol=BINANCE%3ABTCUSDT&interval=1&hidesidetoolbar=1&hidetoptoolbar=0&saveimage=0&toolbarbg=0d0d0d&theme=dark&style=1&timezone=Etc%2FUTC&studies=%5B%5D&hideideas=1&showpopupbutton=0"
+        scrolling="no" allowtransparency="true" frameborder="0"
+        title="BTCUSDT live chart"></iframe>
     </div>
     <div class="panel">
       <div class="panel-title">Equity</div>
@@ -373,15 +441,11 @@ setInterval(()=>{
   }
 },1000);
 const eq={{d.equity|tojson}};
-const up={{d.btc_change}}>=0;
-const gc=up?'#1a7a4a':'#b83232';
-const gf=up?'rgba(26,122,74,0.07)':'rgba(184,50,50,0.07)';
 const eup=eq[eq.length-1]>=eq[0];
-const ec=eup?'#1a7a4a':'#b83232';
-const ef=eup?'rgba(26,122,74,0.07)':'rgba(184,50,50,0.07)';
+const ec=eup?'#4ade80':'#f87171';
+const ef=eup?'rgba(74,222,128,0.10)':'rgba(248,113,113,0.10)';
 const base={responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>'$'+c.parsed.y.toLocaleString()}}}};
-new Chart(document.getElementById('btcChart'),{type:'line',data:{labels:btc.map((_,i)=>i),datasets:[{data:btc,borderColor:gc,backgroundColor:gf,borderWidth:1.5,fill:true,tension:0.3,pointRadius:0}]},options:{...base,scales:{x:{display:false},y:{grid:{color:'#f5f5f3'},border:{display:false},ticks:{font:{family:'JetBrains Mono',size:10},color:'#aaa',callback:v=>'$'+v.toLocaleString(),maxTicksLimit:4}}}}});
-new Chart(document.getElementById('eqChart'),{type:'line',data:{labels:eq.map((_,i)=>i),datasets:[{data:eq,borderColor:ec,backgroundColor:ef,borderWidth:1.5,fill:true,tension:0.3,pointRadius:0}]},options:{...base,scales:{x:{display:false},y:{grid:{color:'#f5f5f3'},border:{display:false},ticks:{font:{family:'JetBrains Mono',size:10},color:'#aaa',callback:v=>'$'+v.toFixed(0),maxTicksLimit:3}}}}});
+new Chart(document.getElementById('eqChart'),{type:'line',data:{labels:eq.map((_,i)=>i),datasets:[{data:eq,borderColor:ec,backgroundColor:ef,borderWidth:1.5,fill:true,tension:0.3,pointRadius:0}]},options:{...base,scales:{x:{display:false},y:{grid:{color:'#222'},border:{display:false},ticks:{font:{family:'JetBrains Mono',size:10},color:'#666',callback:v=>'$'+v.toFixed(0),maxTicksLimit:3}}}}});
 </script>
 </body>
 </html>"""
@@ -423,7 +487,7 @@ def index():
 
 if __name__ == "__main__":
     threading.Thread(target=trade_loop, daemon=True).start()
-    print("\n  http://localhost:5000\n")
-import os
-port = int(os.environ.get("PORT", 5000))
-app.run(debug=False, host="0.0.0.0", port=port)
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    print(f"\n  http://localhost:{port}\n")
+    app.run(debug=False, host="0.0.0.0", port=port)
