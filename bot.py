@@ -66,6 +66,7 @@ state = {
     "equity": [1000.0],
     "wins": 0,
     "losses": 0,
+    "whale_score": 0.0,
 }
 
 def get_candles():
@@ -126,6 +127,47 @@ def calc_atr(highs, lows, closes, p=14):
         tr.append(max(h - l, abs(h - pc), abs(l - pc)))
     return float(np.mean(tr[-p:]))
 
+WHALE_THRESHOLD_BTC = 1.0  # trades >= 1 BTC count as whale-sized
+
+def get_whale_score():
+    """Net whale flow over recent trades. -1..+1 (- = sellers, + = buyers)."""
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/aggTrades",
+            params={"symbol": "BTCUSDT", "limit": 500}, timeout=5,
+        )
+        if r.status_code == 200:
+            buys = sells = 0.0
+            for t in r.json():
+                q = float(t.get("q", 0))
+                if q < WHALE_THRESHOLD_BTC: continue
+                if t.get("m"): sells += q
+                else: buys += q
+            total = buys + sells
+            if total >= 0.1:
+                return (buys - sells) / total
+    except Exception:
+        pass
+    try:
+        r = requests.get(
+            "https://api.exchange.coinbase.com/products/BTC-USD/trades",
+            params={"limit": 500}, timeout=5,
+            headers={"User-Agent": "btc-bot/1.0"},
+        )
+        if r.status_code == 200:
+            buys = sells = 0.0
+            for t in r.json():
+                size = float(t.get("size", 0))
+                if size < WHALE_THRESHOLD_BTC: continue
+                if t.get("side") == "buy": buys += size
+                else: sells += size
+            total = buys + sells
+            if total >= 0.1:
+                return (buys - sells) / total
+    except Exception:
+        pass
+    return 0.0
+
 def trade_loop():
     bankroll, wins, losses, equity, saved_trades = load_state()
     state["bankroll"] = bankroll
@@ -169,11 +211,13 @@ def trade_loop():
             if atr_window else 0.5
         )
 
+        whale = get_whale_score()
         state["btc_price"]   = round(price, 2)
         state["btc_change"]  = round(chg, 4)
         state["btc_candles"] = [round(float(c[4]),2) for c in candles[-30:]]
         state["momentum"]    = round(mom*100, 4)
         state["rsi"]         = round(r, 1)
+        state["whale_score"] = round(whale, 2)
 
         # ── Settle pending trades (5 minutes old) ────────────────────────
         now = time.time()
@@ -225,6 +269,14 @@ def trade_loop():
             elif atr_pct > 0.95:
                 skip_reason = f"whipsaw (ATR pct {atr_pct:.2f})"
                 sig = "HOLD"
+
+        # Whale flow filter: skip if whales strongly disagree with our direction
+        if sig == "UP" and whale < -0.30:
+            skip_reason = f"whales selling ({whale:+.2f})"
+            sig = "HOLD"
+        elif sig == "DOWN" and whale > 0.30:
+            skip_reason = f"whales buying ({whale:+.2f})"
+            sig = "HOLD"
 
         # Cooldown after a recent loss
         if sig != "HOLD" and (now - last_loss_at) < LOSS_COOLDOWN_SEC:
@@ -391,6 +443,15 @@ footer{font-size:11px;color:#666;margin-top:14px;display:flex;justify-content:sp
         title="BTCUSDT live chart"></iframe>
     </div>
     <div class="panel">
+      <div class="panel-title">BTC whales — large buys / sells</div>
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:500;color:{{d.whale_cls_color}}">{{"+" if d.whale_score>=0 else ""}}{{d.whale_score}}</div>
+        <div style="flex:1;font-size:11px;color:#777">{{d.whale_text}}</div>
+        <a href="https://tradermap.io/chart/BTC" target="_blank" rel="noopener"
+           style="display:inline-block;padding:8px 14px;background:#1f1f1f;border:1px solid #2a2a2a;border-radius:6px;color:#e8e8e6;text-decoration:none;font-size:11px;font-weight:500">Tradermap &#8599;</a>
+      </div>
+    </div>
+    <div class="panel">
       <div class="panel-title">Equity</div>
       <div style="position:relative;height:80px">
         <canvas id="eqChart" role="img" aria-label="Equity curve">Portfolio equity.</canvas>
@@ -505,6 +566,11 @@ def index():
         "wins":        state["wins"],
         "losses":      state["losses"],
         "time":        time.strftime("%H:%M:%S"),
+        "whale_score": state.get("whale_score", 0.0),
+        "whale_cls_color": "#4ade80" if state.get("whale_score", 0.0) > 0 else ("#f87171" if state.get("whale_score", 0.0) < 0 else "#888"),
+        "whale_text": ("Whales buying — bias up" if state.get("whale_score", 0.0) > 0.3
+                       else "Whales selling — bias down" if state.get("whale_score", 0.0) < -0.3
+                       else "Mixed / no large flow"),
     })()
     return render_template_string(HTML, d=d)
 
